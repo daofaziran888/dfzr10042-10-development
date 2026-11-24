@@ -1,6 +1,6 @@
 """洞察工坊 · 跨模块分析管道
 
-实现 10 条关键跨模块数据流：
+实现 11 条关键跨模块数据流：
 1. metric_def -> olap_query -> query_cache -> dashboard_def
 2. dimension_def -> drill_path -> olap_query
 3. event_track -> segment_builder -> user_segment
@@ -11,6 +11,7 @@
 8. olap_query -> data_export -> data_snapshot
 9. dataset_join -> olap_query -> report_builder
 10. ranking_board -> metric_def
+11. cohort_analysis -> cohort_revisit -> data_export
 
 所有管道函数都是确定性纯函数，可直接用于测试。
 """
@@ -26,6 +27,7 @@ from app.models import (
     AttributionAlgorithm,
     AttributionModel,
     CohortAnalysis,
+    CohortRevisitLedger,
     DashboardDef,
     DataExport,
     DataSnapshot,
@@ -651,6 +653,61 @@ def pipeline_ranking_to_metric(
 
 
 # ============================================================
+# 流 11: cohort_analysis -> cohort_revisit -> data_export
+# 同期群 -> 回访批次 -> 导出工作台复核抽样
+# ============================================================
+
+def pipeline_cohort_revisit_export(
+    ledgers: list[CohortRevisitLedger],
+    review_window: int,
+    sample_columns: list[str] | None = None,
+    sample_limit: int | None = None,
+) -> dict[str, Any]:
+    """同期群回访批次到导出工作台复核抽样的完整管道。
+
+    1. 按已确认回访事实计算各期留存分子/分母
+    2. 为指定观察窗口生成复核抽样（按日期和成员排序、列投影、行数限制）
+    3. 组装导出任务，拒绝原因单列
+    """
+    cohorts = []
+
+    for ledger in ledgers:
+        curve = ledger.retention_curve()
+        sampling = ledger.review_sampling(
+            review_window, columns=sample_columns, limit=sample_limit
+        )
+
+        export = DataExport(
+            task_id=f"EXP_{ledger.cohort_id}_D{review_window}",
+            source_query=OlapQuery(
+                query_id=f"Q_{ledger.cohort_id}_REVIEW",
+                query_name=f"复核抽样_{ledger.cohort_id}_第{review_window}天",
+            ),
+            export_format="csv",
+            field_selection=sample_columns or [],
+            row_limit=sample_limit if sample_limit is not None else 100000,
+            order_by="revisit_date",
+            file_path=f"/exports/{ledger.cohort_id}_d{review_window}_review.csv",
+        )
+
+        cohorts.append({
+            "cohort_id": ledger.cohort_id,
+            "retention_curve": curve,
+            "review_window": review_window,
+            "export_task": export.task_id,
+            "export_file": export.file_path,
+            "sample_rows": sampling["样本"],
+            "rejections": sampling["拒绝明细"],
+        })
+
+    return {
+        "pipeline": "cohort_analysis -> cohort_revisit -> data_export",
+        "cohorts": cohorts,
+        "total_cohorts": len(cohorts),
+    }
+
+
+# ============================================================
 # 全量跨模块集成管道
 # ============================================================
 
@@ -734,6 +791,15 @@ def run_full_analysis_pipeline(
     if ranking_boards:
         all_results["flow10_ranking"] = pipeline_ranking_to_metric(
             ranking_boards, sample_data.get("ranking_data", {})
+        )
+
+    # 流 11
+    if sample_data.get("cohort_ledgers"):
+        all_results["flow11_cohort_revisit"] = pipeline_cohort_revisit_export(
+            sample_data["cohort_ledgers"],
+            review_window=sample_data.get("cohort_review_window", 7),
+            sample_columns=sample_data.get("cohort_sample_columns"),
+            sample_limit=sample_data.get("cohort_sample_limit"),
         )
 
     return all_results

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -608,6 +609,386 @@ class CohortAnalysis:
                     active_count += 1
             retentions.append(round(active_count / self.member_base_count, 4))
         return retentions
+
+    def build_revisit_ledger(self, members: dict[str, str]) -> CohortRevisitLedger:
+        """基于本群观察窗口创建回访台账，从合作方文件按真实成员和观察日恢复留存。"""
+        return CohortRevisitLedger(
+            cohort_id=self.cohort_id,
+            members=dict(members),
+            observation_windows=list(self.observation_windows),
+        )
+
+
+# ============================================================
+# 同期群回访批次
+# ============================================================
+
+class RevisitRejectReason(str, Enum):
+    """回访行被拒绝的两类业务原因，复核抽样时单列。"""
+    MEMBER_MISMATCH = "成员不符"
+    WINDOW_MISMATCH = "观察期不符"
+
+
+# 天干在中文业务里常用作次序标记（甲、乙、丙…），成员排序按此序列对齐，
+# 其余字符退回字符串顺序，保证排序确定且符合业务直觉。
+_STEM_ORDER = "甲乙丙丁戊己庚辛壬癸"
+
+
+def _member_sort_key(member_id: str) -> tuple:
+    """成员排序键：天干字符按甲乙丙…次序，其余字符按字符串顺序。"""
+    return tuple(
+        (0, _STEM_ORDER.index(ch)) if ch in _STEM_ORDER else (1, ch)
+        for ch in member_id
+    )
+
+
+@dataclass(frozen=True)
+class RevisitFact:
+    """回访事实：合作方文件中一行通过校验的成员回访记录。"""
+    member_id: str
+    observation_day: int
+    revisit_date: str
+    source_file: str = ""
+
+    @property
+    def dedup_key(self) -> tuple[str, int]:
+        """幂等键：同一成员同一观察日的回访只登记一次。"""
+        return (self.member_id, self.observation_day)
+
+
+@dataclass
+class RevisitRejection:
+    """被拒绝的回访行：保留原始内容与拒绝原因，供导出工作台复核。"""
+    member_id: str
+    observation_day: int
+    reason: RevisitRejectReason
+    source_file: str = ""
+    detail: str = ""
+
+
+@dataclass
+class CohortRevisitBatch:
+    """同期群回访批次：一次合作方文件导入的登记结果。
+
+    facts 为通过校验的回访行；duplicates 为重复送达（独立登记，不覆盖已确认
+    事实）；rejections 区分成员不符与观察期不符；parse_failures 保留无法解析
+    的原始行，存在解析失败的批次不完整，不得确认、不得生成结论。
+    """
+    batch_id: str
+    cohort_id: str
+    source_file: str
+    status: str = "待确认"
+    facts: list[RevisitFact] = field(default_factory=list)
+    rejections: list[RevisitRejection] = field(default_factory=list)
+    duplicates: list[RevisitFact] = field(default_factory=list)
+    parse_failures: list[str] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        """文件完整（无解析失败）才允许确认并参与留存结论。"""
+        return not self.parse_failures
+
+
+@dataclass
+class PeriodConclusion:
+    """单个观察窗口的留存结论：分子、分母、留存率和发出顺序。"""
+    window: int
+    numerator: int
+    denominator: int
+    rate: float
+    round_id: int = 0
+    issue_seq: int = 0
+
+
+@dataclass
+class RetentionReport:
+    """一轮留存报告发布结果：未发布时给出暂缓原因。"""
+    cohort_id: str
+    round_id: int
+    released: bool
+    conclusions: list[PeriodConclusion] = field(default_factory=list)
+    hold_reason: str = ""
+
+
+@dataclass
+class CohortRevisitLedger:
+    """同期群回访台账：跨批次登记回访事实，幂等去重，按窗口计算留存。
+
+    - 导入按 (成员, 观察日) 幂等，重复送达独立登记，不覆盖已确认事实；
+    - 拒绝区分成员不符与观察期不符；解析失败使批次不完整、禁止确认；
+    - 两次并发导入同一回访只记一次：导入与确认都在锁内完成登记。
+    """
+    cohort_id: str
+    members: dict[str, str] = field(default_factory=dict)  # 成员 -> 起始日
+    observation_windows: list[int] = field(default_factory=lambda: [1, 7])
+    batches: list[CohortRevisitBatch] = field(default_factory=list)
+    confirmed_facts: dict[tuple[str, int], RevisitFact] = field(default_factory=dict)
+    issued_conclusions: list[PeriodConclusion] = field(default_factory=list)
+    release_round: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    @property
+    def max_window(self) -> int:
+        return max(self.observation_windows) if self.observation_windows else 0
+
+    def find_batch(self, batch_id: str) -> CohortRevisitBatch | None:
+        for batch in self.batches:
+            if batch.batch_id == batch_id:
+                return batch
+        return None
+
+    def _active_index(self) -> dict[tuple[str, int], RevisitFact]:
+        """已确认事实 + 待确认批次中事实的索引。
+
+        部分解析失败和已作废的批次不参与去重，其中的行允许由更正文件重新送达。
+        """
+        index = dict(self.confirmed_facts)
+        for batch in self.batches:
+            if batch.status == "待确认":
+                for fact in batch.facts:
+                    index.setdefault(fact.dedup_key, fact)
+        return index
+
+    def import_file(self, batch_id: str, file_path: str) -> CohortRevisitBatch:
+        """从合作方文件真实读取并导入一个回访批次。"""
+        import os
+        with open(file_path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        return self.import_lines(batch_id, os.path.basename(file_path), lines)
+
+    def import_lines(
+        self,
+        batch_id: str,
+        source_file: str,
+        lines: list[str],
+    ) -> CohortRevisitBatch:
+        """解析合作方文件行，登记事实、重复、拒绝和解析失败。"""
+        batch = CohortRevisitBatch(
+            batch_id=batch_id, cohort_id=self.cohort_id, source_file=source_file
+        )
+        with self._lock:
+            active = self._active_index()
+            for raw in lines:
+                line = raw.strip()
+                if not line:
+                    continue
+                parts = [part.strip() for part in line.split(",")]
+                if parts and parts[0].casefold() == "member_id":
+                    continue  # 表头
+                parsed = self._parse_row(parts)
+                if parsed is None:
+                    batch.parse_failures.append(line)
+                    continue
+                member_id, observation_day, revisit_date = parsed
+                if member_id not in self.members:
+                    batch.rejections.append(RevisitRejection(
+                        member_id=member_id,
+                        observation_day=observation_day,
+                        reason=RevisitRejectReason.MEMBER_MISMATCH,
+                        source_file=source_file,
+                        detail="回访成员不属于本同期群",
+                    ))
+                    continue
+                if observation_day < 1 or observation_day > self.max_window:
+                    batch.rejections.append(RevisitRejection(
+                        member_id=member_id,
+                        observation_day=observation_day,
+                        reason=RevisitRejectReason.WINDOW_MISMATCH,
+                        source_file=source_file,
+                        detail="观察日超出本群观察期",
+                    ))
+                    continue
+                record = RevisitFact(
+                    member_id=member_id,
+                    observation_day=observation_day,
+                    revisit_date=revisit_date,
+                    source_file=source_file,
+                )
+                if record.dedup_key in active:
+                    batch.duplicates.append(record)  # 重复送达独立登记
+                    continue
+                active[record.dedup_key] = record
+                batch.facts.append(record)
+            batch.status = "待确认" if batch.complete else "部分解析失败"
+            self.batches.append(batch)
+        return batch
+
+    @staticmethod
+    def _parse_row(parts: list[str]) -> tuple[str, int, str] | None:
+        """解析一行 member_id,observation_day,revisit_date，失败返回 None。"""
+        if len(parts) != 3:
+            return None
+        member_id, day_raw, date_raw = parts
+        if not member_id:
+            return None
+        try:
+            observation_day = int(day_raw)
+        except ValueError:
+            return None
+        try:
+            datetime.strptime(date_raw, "%Y-%m-%d")
+        except ValueError:
+            return None
+        return member_id, observation_day, date_raw
+
+    def confirm_batch(self, batch_id: str) -> tuple[CohortRevisitBatch | None, str]:
+        """确认批次：不完整文件不得确认；确认时在锁内再次去重，保证幂等。"""
+        with self._lock:
+            batch = self.find_batch(batch_id)
+            if batch is None:
+                return None, f"回访批次 {batch_id} 不存在"
+            if batch.status == "已确认":
+                return batch, f"回访批次 {batch_id} 已确认，无需重复操作"
+            if batch.status == "已作废":
+                return None, f"回访批次 {batch_id} 已作废，不得确认"
+            if not batch.complete:
+                return None, (
+                    f"回访批次 {batch_id} 存在 {len(batch.parse_failures)} 行解析失败，"
+                    "不完整文件不得确认"
+                )
+            accepted: list[RevisitFact] = []
+            for fact in batch.facts:
+                if fact.dedup_key in self.confirmed_facts:
+                    batch.duplicates.append(fact)  # 并发确认时后到的记为重复
+                else:
+                    self.confirmed_facts[fact.dedup_key] = fact
+                    accepted.append(fact)
+            batch.facts = accepted
+            batch.status = "已确认"
+            return batch, f"回访批次 {batch_id} 已确认，登记 {len(accepted)} 条回访事实"
+
+    def void_batch(self, batch_id: str) -> tuple[CohortRevisitBatch | None, str]:
+        """作废批次：已确认批次不得作废；作废后不再阻塞发布、不参与去重。"""
+        with self._lock:
+            batch = self.find_batch(batch_id)
+            if batch is None:
+                return None, f"回访批次 {batch_id} 不存在"
+            if batch.status == "已确认":
+                return None, f"回访批次 {batch_id} 已确认，不得作废"
+            if batch.status == "已作废":
+                return batch, f"回访批次 {batch_id} 已作废，无需重复操作"
+            batch.status = "已作废"
+            return batch, f"回访批次 {batch_id} 已作废"
+
+    def period_figures(self, window: int) -> tuple[int, int]:
+        """某观察窗口的 (分子, 分母)。
+
+        分子为观察日 <= 窗口的已确认事实覆盖的去重本群成员数（按观察日截断），
+        分母为本群成员基数。
+        """
+        hit = {
+            fact.member_id
+            for fact in self.confirmed_facts.values()
+            if fact.observation_day <= window and fact.member_id in self.members
+        }
+        return len(hit), len(self.members)
+
+    def retention_curve(self) -> list[dict[str, Any]]:
+        """按回访批次确认的分子分母计算各期留存曲线。"""
+        curve = []
+        for window in sorted(self.observation_windows):
+            numerator, denominator = self.period_figures(window)
+            curve.append({
+                "window": window,
+                "numerator": numerator,
+                "denominator": denominator,
+                "rate": round(numerator / denominator, 4) if denominator else 0.0,
+            })
+        return curve
+
+    def recompute_window(self, window: int) -> dict[str, Any]:
+        """按历史口径重算某期已确认的分子分母，用于核发前复核。"""
+        numerator, denominator = self.period_figures(window)
+        return {
+            "window": window,
+            "numerator": numerator,
+            "denominator": denominator,
+            "rate": round(numerator / denominator, 4) if denominator else 0.0,
+        }
+
+    def issue_report(self) -> RetentionReport:
+        """本轮发布留存报告：各期结论按窗口升序发出。
+
+        存在待确认或部分解析失败的批次时，本轮不生成任何结论。
+        """
+        with self._lock:
+            blocking = [
+                batch for batch in self.batches
+                if batch.status in ("待确认", "部分解析失败")
+            ]
+            if blocking:
+                reasons = "、".join(f"{b.batch_id}({b.status})" for b in blocking)
+                return RetentionReport(
+                    cohort_id=self.cohort_id,
+                    round_id=self.release_round,
+                    released=False,
+                    hold_reason=f"批次 {reasons} 未完成确认，本期结论暂缓",
+                )
+            self.release_round += 1
+            conclusions: list[PeriodConclusion] = []
+            for window in sorted(self.observation_windows):
+                numerator, denominator = self.period_figures(window)
+                conclusion = PeriodConclusion(
+                    window=window,
+                    numerator=numerator,
+                    denominator=denominator,
+                    rate=round(numerator / denominator, 4) if denominator else 0.0,
+                    round_id=self.release_round,
+                    issue_seq=len(self.issued_conclusions) + 1,
+                )
+                self.issued_conclusions.append(conclusion)
+                conclusions.append(conclusion)
+            return RetentionReport(
+                cohort_id=self.cohort_id,
+                round_id=self.release_round,
+                released=True,
+                conclusions=conclusions,
+            )
+
+    def review_sampling(
+        self,
+        window: int,
+        columns: list[str] | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """导出工作台复核抽样：读取实际参与该期计算的已确认事实。
+
+        按回访日期和成员排序，支持按列投影和限定行数；拒绝原因单列。
+        """
+        facts = [
+            fact for fact in self.confirmed_facts.values()
+            if fact.observation_day <= window
+        ]
+        facts.sort(key=lambda f: (f.revisit_date, _member_sort_key(f.member_id)))
+        rows = [
+            {
+                "成员": fact.member_id,
+                "观察日": fact.observation_day,
+                "回访日期": fact.revisit_date,
+                "来源文件": fact.source_file,
+            }
+            for fact in facts
+        ]
+        if columns:
+            rows = [{key: row[key] for key in columns if key in row} for row in rows]
+        if limit is not None:
+            rows = rows[:limit]
+        rejections = [
+            {
+                "成员": rejection.member_id,
+                "观察日": rejection.observation_day,
+                "拒绝原因": rejection.reason.value,
+                "来源文件": rejection.source_file,
+            }
+            for batch in self.batches
+            for rejection in batch.rejections
+        ]
+        return {
+            "cohort_id": self.cohort_id,
+            "window": window,
+            "样本": rows,
+            "拒绝明细": rejections,
+        }
 
 
 # ============================================================

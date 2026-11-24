@@ -12,6 +12,7 @@ from app.services.attribution_model import AttributionModelService
 from app.services.dashboard_def import DashboardDefService
 from app.services.drill_path import DrillPathService
 from app.services.cohort_analysis import CohortAnalysisService
+from app.services.cohort_revisit import CohortRevisitService
 from app.services.data_export import DataExportService
 from app.services.query_cache import QueryCacheService
 from app.services.scheduled_analysis import ScheduledAnalysisService
@@ -36,6 +37,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "dashboard_def": DashboardDefService(),
     "drill_path": DrillPathService(),
     "cohort_analysis": CohortAnalysisService(),
+    "cohort_revisit": CohortRevisitService(),
     "data_export": DataExportService(),
     "query_cache": QueryCacheService(),
     "scheduled_analysis": ScheduledAnalysisService(),

@@ -11,7 +11,7 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
-│   ├── src/data/modules.ts              18个业务模块配置
+│   ├── src/data/modules.ts              19个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
@@ -60,6 +60,7 @@ npm run dev
 | 看板定义 | `dashboard_def` | 数据看板 | 看板编号、看板名称、布局配置 |
 | 下钻路径 | `drill_path` | 下钻方案 | 方案编号、父级维度、子级维度 |
 | 同期群分析 | `cohort_analysis` | 同期群 | 群组编号、群组名称、划分周期 |
+| 同期群回访 | `cohort_revisit` | 回访批次 | 批次编号、所属群组、来源文件 |
 | 数据导出 | `data_export` | 导出任务 | 任务编号、数据来源、导出格式 |
 | 查询缓存 | `query_cache` | 缓存条目 | 条目编号、查询哈希、结果行数 |
 | 定时分析 | `scheduled_analysis` | 调度任务 | 任务编号、分析方案、Cron表达式 |
